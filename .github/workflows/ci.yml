@@ -1,0 +1,186 @@
+# Copyright 2023 Terramate GmbH
+# SPDX-License-Identifier: MPL-2.0
+
+name: ci
+
+on:
+  workflow_run:
+    workflows: [Terramate Group]
+    types:
+      - completed
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 'Download artifact'
+        uses: actions/github-script@v6
+        with:
+          script: |
+            let allArtifacts = await github.rest.actions.listWorkflowRunArtifacts({
+               owner: context.repo.owner,
+               repo: context.repo.repo,
+               run_id: context.payload.workflow_run.id,
+            });
+            let matchArtifact = allArtifacts.data.artifacts.filter((artifact) => {
+              return artifact.name == "terramate-group"
+            })[0];
+            let download = await github.rest.actions.downloadArtifact({
+               owner: context.repo.owner,
+               repo: context.repo.repo,
+               artifact_id: matchArtifact.id,
+               archive_format: 'zip',
+            });
+            let fs = require('fs');
+            fs.writeFileSync(`${process.env.GITHUB_WORKSPACE}/terramate-group.zip`, Buffer.from(download.data));
+
+      - name: 'Unzip artifact'
+        run: unzip terramate-group.zip
+
+      - name: 'Comment on PR'
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            let fs = require('fs');
+            let issue_number = Number(fs.readFileSync('./.terramate/PR_NUMBER'));
+            let run_id = fs.readFileSync('./.terramate/RUN_ID')
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue_number,
+              body: `Terramate ${run_id} group created!`,
+            });
+
+  checks:
+    runs-on: ubuntu-20.04
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+
+      - name: Configure asdf and plugins needed
+        uses: asdf-vm/actions/install@83133f03f5693901c2296a8e622955087dc20267
+
+      - name: checking go mod tidyness
+        run: terramate run --tags golang --changed -- make mod/check
+
+      - name: linting code
+        run: terramate run --tags golang --changed -- make lint
+
+      - name: checking license on source code
+        run: terramate run --tags golang --changed -- make license/check
+
+  build_test:
+    name: Build and Test
+    runs-on: ${{ matrix.os }}
+    permissions:
+      id-token: write # This is required for requesting the JWT
+      contents: read  # This is required for actions/checkout
+
+    strategy:
+      matrix:
+        os: ["ubuntu-20.04", "macos-13"]
+        go: ["1.21"]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+
+      - uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: 1.6.2
+          tofu_wrapper: false
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure asdf and plugins needed
+        uses: asdf-vm/actions/install@83133f03f5693901c2296a8e622955087dc20267
+
+      - name: make generate
+        run: terramate generate
+
+      - name: make test
+        run: terramate run --tags golang --changed -- make test
+        env:
+          TM_TEST_TERRAFORM_REQUIRED_VERSION: "1.7.5"
+
+      - name: make build
+        run: terramate run --tags golang --changed -- make build
+
+      - name: check cloud info
+        run: terramate run --tags golang --changed -- ./bin/terramate -vv experimental cloud info
+
+  gh_integration_test:
+    name: GHA Integration Test
+
+    runs-on: "ubuntu-20.04"
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{github.event.pull_request.head.ref}}
+          repository: ${{github.event.pull_request.head.repo.full_name}}
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Configure asdf and plugins needed
+        uses: asdf-vm/actions/install@83133f03f5693901c2296a8e622955087dc20267
+
+      - name: make test/ci
+        run: terramate run --tags golang --changed -- make test/ci
+
+  release_dry_run:
+    name: Release Dry Run
+
+    runs-on: ubuntu-20.04
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{github.event.pull_request.head.ref}}
+          repository: ${{github.event.pull_request.head.repo.full_name}}
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Configure asdf and plugins needed
+        uses: asdf-vm/actions/install@83133f03f5693901c2296a8e622955087dc20267
+
+      - name: install cosign 
+        run: go install github.com/sigstore/cosign/v2/cmd/cosign@latest
+      - name: install goreleaser
+        run: |
+          curl -sL https://github.com/goreleaser/goreleaser-pro/releases/download/v1.14.0-pro/goreleaser-pro_Linux_x86_64.tar.gz -o /tmp/goreleaser.tar.gz
+          cd /tmp && tar -xzf goreleaser.tar.gz && chmod +x goreleaser
+          sudo mv /tmp/goreleaser /usr/local/bin/
+      
+      - name: release dry run
+        run: terramate run --tags golang --changed -- make release/dry-run
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GORELEASER_KEY: ${{ secrets.GORELEASER_API_KEY }}
+          FURY_TOKEN: ${{ secrets.FURY_TOKEN}}
+
+
+  ci:
+    needs:
+      - checks
+      - build_test
+      - gh_integration_test
+    runs-on: ubuntu-20.04
+    steps:
+      - uses: Kesin11/actions-timeline@v1
